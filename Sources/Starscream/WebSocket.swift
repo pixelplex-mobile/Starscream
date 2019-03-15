@@ -429,6 +429,9 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
 
     public var respondToPingWithPong: Bool = true
 
+    // Time interval for auto ping in seconds
+    public var pingTimeInterval: Int?
+    
     // MARK: - Private
 
     private struct CompressionState {
@@ -448,6 +451,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
     private let mutex = NSLock()
     private var compressionState = CompressionState()
     private var writeQueue = OperationQueue()
+    private var pingQueue = OperationQueue()
     private var readStack = [WSResponse]()
     private var inputQueue = [Data]()
     private var fragBuffer: Data?
@@ -478,7 +482,9 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
         if let protocols = protocols, !protocols.isEmpty {
             self.request.setValue(protocols.joined(separator: ","), forHTTPHeaderField: headerWSProtocolName)
         }
+        
         writeQueue.maxConcurrentOperationCount = 1
+        pingQueue.maxConcurrentOperationCount = 1
     }
     
     public convenience init(url: URL, protocols: [String]? = nil) {
@@ -491,6 +497,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
     public convenience init(url: URL, writeQueueQOS: QualityOfService, protocols: [String]? = nil) {
         self.init(url: url, protocols: protocols)
         writeQueue.qualityOfService = writeQueueQOS
+        pingQueue.qualityOfService = writeQueueQOS
     }
 
     /**
@@ -724,8 +731,10 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
      */
     private func disconnectStream(_ error: Error?, runDelegate: Bool = true) {
         if error == nil {
+            pingQueue.waitUntilAllOperationsAreFinished()
             writeQueue.waitUntilAllOperationsAreFinished()
         } else {
+            pingQueue.cancelAllOperations()
             writeQueue.cancelAllOperations()
         }
         
@@ -832,6 +841,9 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
             connected = true
             mutex.unlock()
             didDisconnect = false
+            
+            performPingIfNeeded()
+            
             if canDispatch {
                 callbackQueue.async { [weak self] in
                     guard let self = self else { return }
@@ -1306,6 +1318,52 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
             NotificationCenter.default.post(name: NSNotification.Name(WebsocketDidDisconnectNotification), object: self, userInfo: userInfo)
         }
     }
+    
+    /**
+     Add new operation to ping queue if needed.
+     After timeout for ping operation will perform ping message in writeQueue.
+     */
+    private func performPingIfNeeded() {
+        
+        guard let pingTimeInterval = pingTimeInterval else {
+            return
+        }
+        
+        performPing(with: pingTimeInterval)
+    }
+    
+    private func performPing(with interval: Int) {
+        
+        guard isConnected == true else {
+            return
+        }
+        
+        pingQueue.cancelAllOperations()
+        
+        let operation = BlockOperation()
+        operation.addExecutionBlock { [weak operation, weak self] in
+            
+            guard operation?.isCancelled == false else {
+                return
+            }
+            
+            let waitTime = DispatchTime.now() + .seconds(interval)
+            let semaphore = DispatchSemaphore(value: 0)
+            _ = semaphore.wait(timeout: waitTime)
+            
+            guard operation?.isCancelled == false else {
+                return
+            }
+            
+            if self?.isConnected == true {
+                self?.dequeueWrite(Data(), code: .ping)
+                self?.performPing(with: interval)
+            }
+        }
+        
+        pingQueue.addOperation(operation)
+    }
+
 
     // MARK: - Deinit
 
@@ -1314,6 +1372,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
         readyToWrite = false
         cleanupStream()
         mutex.unlock()
+        pingQueue.cancelAllOperations()
         writeQueue.cancelAllOperations()
     }
 
